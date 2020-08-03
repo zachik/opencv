@@ -47,7 +47,8 @@
 #include "op_cuda.hpp"
 
 #ifdef HAVE_CUDA
-#include "cuda4dnn/primitives/eltwise.hpp"
+#include "cuda4dnn/init.hpp"
+#include "cuda4dnn/primitives/eltwise.hpp" // required by fuseLayers
 #endif
 
 #include "halide_scheduler.hpp"
@@ -65,8 +66,6 @@
 
 #include <opencv2/core/utils/configuration.private.hpp>
 #include <opencv2/core/utils/logger.hpp>
-
-#include <opencv2/core/cuda.hpp>
 
 namespace cv {
 namespace dnn {
@@ -159,23 +158,6 @@ public:
     }
 #endif
 
-#ifdef HAVE_CUDA
-    static inline bool cudaDeviceSupportsFp16() {
-        if (cv::cuda::getCudaEnabledDeviceCount() <= 0)
-            return false;
-        const int devId = cv::cuda::getDevice();
-        if (devId<0)
-            return false;
-        cv::cuda::DeviceInfo dev_info(devId);
-        if (!dev_info.isCompatible())
-            return false;
-        int version = dev_info.majorVersion() * 10 + dev_info.minorVersion();
-        if (version < 53)
-            return false;
-        return true;
-    }
-#endif
-
 private:
     BackendRegistry()
     {
@@ -247,9 +229,10 @@ private:
 #endif
 
 #ifdef HAVE_CUDA
-        if (haveCUDA()) {
+        if (haveCUDA() && cuda4dnn::isDeviceCompatible())
+        {
             backends.push_back(std::make_pair(DNN_BACKEND_CUDA, DNN_TARGET_CUDA));
-            if (cudaDeviceSupportsFp16())
+            if (cuda4dnn::doesDeviceSupportFP16())
                 backends.push_back(std::make_pair(DNN_BACKEND_CUDA, DNN_TARGET_CUDA_FP16));
         }
 #endif
@@ -1189,19 +1172,6 @@ struct Net::Impl : public detail::NetImplBase
         preferableBackend = DNN_BACKEND_DEFAULT;
         preferableTarget = DNN_TARGET_CPU;
         skipInfEngineInit = false;
-
-#ifdef HAVE_CUDA
-        if (cv::cuda::getCudaEnabledDeviceCount() > 0)
-        {
-            cuda4dnn::csl::CSLContext context;
-            context.stream = cuda4dnn::csl::Stream(true);
-            context.cublas_handle = cuda4dnn::csl::cublas::Handle(context.stream);
-            context.cudnn_handle = cuda4dnn::csl::cudnn::Handle(context.stream);
-
-            auto d2h_stream = cuda4dnn::csl::Stream(true); // stream for background D2H data transfers
-            cudaInfo = std::unique_ptr<CudaInfo_t>(new CudaInfo_t(std::move(context), std::move(d2h_stream)));
-        }
-#endif
     }
 
     Ptr<DataLayer> netInputLayer;
@@ -1300,13 +1270,6 @@ struct Net::Impl : public detail::NetImplBase
         }
 
         Ptr<BackendWrapper> wrapper = wrapMat(preferableBackend, preferableTarget, host);
-#ifdef HAVE_CUDA
-        if (preferableBackend == DNN_BACKEND_CUDA)
-        {
-            auto cudaWrapper = wrapper.dynamicCast<CUDABackendWrapper>();
-            cudaWrapper->setStream(cudaInfo->context.stream, cudaInfo->d2h_stream);
-        }
-#endif
         backendWrappers[data] = wrapper;
         return wrapper;
     }
@@ -2374,10 +2337,57 @@ struct Net::Impl : public detail::NetImplBase
 #endif
     }
 
-    void initCUDABackend(const std::vector<LayerPin>& blobsToKeep_) {
+    void initCUDABackend(const std::vector<LayerPin>& blobsToKeep_)
+    {
         CV_Assert(haveCUDA());
+        CV_Assert(preferableBackend == DNN_BACKEND_CUDA);
 
 #ifdef HAVE_CUDA
+        if (cuda4dnn::getDeviceCount() <= 0)
+            CV_Error(Error::StsError, "No CUDA capable device found.");
+
+        if (cuda4dnn::getDevice() < 0)
+            CV_Error(Error::StsError, "No CUDA capable device selected.");
+
+        if (!cuda4dnn::isDeviceCompatible())
+            CV_Error(Error::GpuNotSupported, "OpenCV was not built to work with the selected device. Please check CUDA_ARCH_PTX or CUDA_ARCH_BIN in your build configuration.");
+
+        if (preferableTarget == DNN_TARGET_CUDA_FP16 && !cuda4dnn::doesDeviceSupportFP16())
+            CV_Error(Error::StsError, "The selected CUDA device does not support FP16 operations.");
+
+        if (!cudaInfo)
+        {
+            cuda4dnn::csl::CSLContext context;
+            context.stream = cuda4dnn::csl::Stream(true);
+            context.cublas_handle = cuda4dnn::csl::cublas::Handle(context.stream);
+            context.cudnn_handle = cuda4dnn::csl::cudnn::Handle(context.stream);
+
+            auto d2h_stream = cuda4dnn::csl::Stream(true); // stream for background D2H data transfers
+            cudaInfo = std::unique_ptr<CudaInfo_t>(new CudaInfo_t(std::move(context), std::move(d2h_stream)));
+            cuda4dnn::checkVersions();
+        }
+
+        cudaInfo->workspace = cuda4dnn::csl::Workspace(); // release workspace memory if any
+
+        for (auto& layer : layers)
+        {
+            auto& ld = layer.second;
+            if (ld.id == 0)
+            {
+                for (auto& wrapper : ld.inputBlobsWrappers)
+                {
+                    auto cudaWrapper = wrapper.dynamicCast<CUDABackendWrapper>();
+                    cudaWrapper->setStream(cudaInfo->context.stream, cudaInfo->d2h_stream);
+                }
+            }
+
+            for (auto& wrapper : ld.outputBlobsWrappers)
+            {
+                auto cudaWrapper = wrapper.dynamicCast<CUDABackendWrapper>();
+                cudaWrapper->setStream(cudaInfo->context.stream, cudaInfo->d2h_stream);
+            }
+        }
+
         for (auto& layer : layers)
         {
             auto& ld = layer.second;
@@ -2646,32 +2656,21 @@ struct Net::Impl : public detail::NetImplBase
                     Ptr<EltwiseLayer> nextEltwiseLayer;
                     if( nextData )
                         nextEltwiseLayer = nextData->layerInstance.dynamicCast<EltwiseLayer>();
-
 #ifdef HAVE_CUDA
                     // CUDA backend supports fusion with eltwise sum (without variable channels)
                     // `nextEltwiseLayer` is reset if eltwise layer doesn't have a compatible configuration for fusion
                     if (IS_DNN_CUDA_TARGET(preferableTarget) && !nextEltwiseLayer.empty())
                     {
                         // we create a temporary backend node for eltwise layer to obtain the eltwise configuration
-                        auto context = cudaInfo->context; /* make a copy so that initCUDA doesn't modify cudaInfo */
+                        cuda4dnn::csl::CSLContext context; // assume that initCUDA and EltwiseOp do not use the context during init
                         const auto node = nextData->layerInstance->initCUDA(&context, nextData->inputBlobsWrappers, nextData->outputBlobsWrappers);
                         const auto eltwiseNode = node.dynamicCast<cuda4dnn::EltwiseOpBase>();
-                        if (eltwiseNode->op != cuda4dnn::EltwiseOpType::SUM || !eltwiseNode->coeffs.empty())
-                             nextEltwiseLayer = Ptr<EltwiseLayer>();
-
-                        // check for variable channels
-                        auto& inputs = nextData->inputBlobs;
-                        for (int i = 1; i < inputs.size(); ++i)
-                        {
-                            if (inputs[i]->size[1] != inputs[0]->size[1])
-                            {
-                                nextEltwiseLayer = Ptr<EltwiseLayer>();
-                                break;
-                            }
-                        }
+                        // CUDA backend uses EltwiseOp when all operands have the same number of channels; otherwise, ShortcutOp is used.
+                        // Hence, a successful cast to EltwiseOp implies that the number of channels is same in all operand tensors.
+                        if (eltwiseNode.empty() || eltwiseNode->op != cuda4dnn::EltwiseOpType::SUM || !eltwiseNode->coeffs.empty())
+                            nextEltwiseLayer = Ptr<EltwiseLayer>();
                     }
 #endif
-
                     if (!nextEltwiseLayer.empty() && nextData && nextData->inputBlobsId.size() == 2)
                     {
                         LayerData *eltwiseData = nextData;
@@ -2715,7 +2714,8 @@ struct Net::Impl : public detail::NetImplBase
                                 {
                                     nextData = &layers[eltwiseData->consumers[0].lid];
                                     lpNext = LayerPin(eltwiseData->consumers[0].lid, 0);
-                                    if (pinsToKeep.count(lpNext) == 0 && nextData->outputBlobs.size() == 1)
+                                    CV_Assert(nextData);
+                                    if (nextData->outputBlobs.size() == 1)
                                         nextFusabeleActivLayer = nextData->layerInstance.dynamicCast<ActivationLayer>();
                                 }
                                 else
